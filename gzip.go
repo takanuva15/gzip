@@ -2,10 +2,12 @@ package gzip
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"errors"
 	"net"
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 )
@@ -27,15 +29,21 @@ type gzipWriter struct {
 	writer        *gzip.Writer
 	statusWritten bool
 	status        int
+	// minLength is the minimum length of the response body (in bytes) to enable compression
+	minLength int
+	// shouldCompress indicates whether the minimum length for compression has been met
+	shouldCompress bool
+	// buffer to store response data in case compression limit not met
+	buffer bytes.Buffer
 }
 
 func (g *gzipWriter) WriteString(s string) (int, error) {
 	return g.Write([]byte(s))
 }
 
+// Write writes the given data to the appropriate underlying writer.
+// Note that this method can be called multiple times within a single request.
 func (g *gzipWriter) Write(data []byte) (int, error) {
-	g.Header().Del("Content-Length")
-
 	// Check status from ResponseWriter if not set via WriteHeader
 	if !g.statusWritten {
 		g.status = g.ResponseWriter.Status()
@@ -45,6 +53,34 @@ func (g *gzipWriter) Write(data []byte) (int, error) {
 	if g.status >= 400 {
 		g.removeGzipHeaders()
 		return g.ResponseWriter.Write(data)
+	}
+
+	// If a Content-Length header is set, use that to decide whether to compress the response.
+	if g.Header().Get("Content-Length") != "" {
+		// invalid header treated the same as having no Content-Length
+		contentLen, err := strconv.Atoi(g.Header().Get("Content-Length"))
+		if err == nil {
+			if contentLen < g.minLength {
+				return g.ResponseWriter.Write(data)
+			}
+			g.shouldCompress = true
+			g.Header().Del("Content-Length")
+		}
+	}
+
+	// Check if the response body is large enough to be compressed. If so, skip this condition and proceed with the
+	// normal write process. If not, store the data in the buffer in case more data is written later.
+	// (At the end, if the response body is still too small, the caller should check shouldCompress and
+	// use the data stored in the buffer to write the response instead.)
+	if !g.shouldCompress && len(data) >= g.minLength {
+		g.shouldCompress = true
+	} else if !g.shouldCompress {
+		lenWritten, err := g.buffer.Write(data)
+		if err != nil || g.buffer.Len() < g.minLength {
+			return lenWritten, err
+		}
+		g.shouldCompress = true
+		data = g.buffer.Bytes()
 	}
 
 	return g.writer.Write(data)
@@ -95,7 +131,6 @@ func (g *gzipWriter) WriteHeader(code int) {
 		g.removeGzipHeaders()
 	}
 
-	g.Header().Del("Content-Length")
 	g.ResponseWriter.WriteHeader(code)
 }
 
